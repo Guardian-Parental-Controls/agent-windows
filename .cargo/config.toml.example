@@ -1,0 +1,2 @@
+[patch."https://github.com/Guardian-Parental-Controls/agent-common"]
+guardian-agent-common = { path = "../agent-common" }
