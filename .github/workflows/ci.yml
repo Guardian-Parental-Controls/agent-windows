@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: ../agent-common
+      - name: Use sibling path for common
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' \
+            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
+            'guardian-agent-common = { path = "../agent-common" }' \
+            > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib
