@@ -59,7 +59,17 @@ jobs:
           $wix = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
           if (-not (Test-Path $wix)) { $wix = "${env:ProgramFiles}\WiX Toolset v3.14\bin" }
           $env:PATH = "$wix;$env:PATH"
-          ./scripts/package-release.ps1 -Version "${{ needs.resolve.outputs.version }}" -OutDir dist
+          $stage = Join-Path $PWD "dist\staging"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\release\guardian-agent.exe" (Join-Path $stage "guardian-agent.exe")
+          Copy-Item "overlay_resources\blockedv2.html" (Join-Path $stage "blockedv2.html")
+          $wixObj = Join-Path $PWD "dist\guardian-agent.wixobj"
+          $msiName = "guardian-agent-x86_64-pc-windows-msvc.msi"
+          $msiPath = Join-Path $PWD "dist\$msiName"
+          & candle.exe "-dVersion=${{ needs.resolve.outputs.version }}" "-dSourceDir=$stage" guardian-agent.wxs -out $wixObj
+          & light.exe -ext WixUIExtension $wixObj -out $msiPath
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $msiPath).Hash.ToLower()
+          Set-Content -Path "$msiPath.sha256" -Value $hash -NoNewline
 
       - uses: actions/upload-artifact@v4
         with:
