@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out agent-windows
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: ${{ env.RELEASE_TAG }}
+          path: _agent-common
+
+      - name: Use path patch for common
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' \
+            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
+            'guardian-agent-common = { path = "_agent-common" }' \
+            > .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install WiX Toolset
+        shell: powershell
+        run: choco install wixtoolset --no-progress -y
+
+      - name: Build release binary
+        shell: bash
+        env:
+          GUARDIAN_AGENT_VERSION: ${{ env.RELEASE_TAG }}
+        run: cargo build --release
+
+      - name: Package MSI release
+        shell: powershell
+        run: |
+          $version = "${{ env.RELEASE_TAG }}".TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Unsupported release tag for MSI product version: ${{ env.RELEASE_TAG }}"
+          }
+          $msiVersion = "$version.0"
+          ./scripts/package-windows-release.ps1 -Version $msiVersion -OutputDir dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            dist/guardian-agent-x86_64-pc-windows-msvc.msi
+            dist/guardian-agent-x86_64-pc-windows-msvc.msi.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Create versions automation token
+        if: secrets.GUARDIAN_VERSIONS_APP_ID != ''
+        id: versions-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
+          private-key: ${{ secrets.GUARDIAN_VERSIONS_PRIVATE_KEY }}
+          owner: Guardian-Parental-Controls
+          repositories: versions
+
+      - name: Publish agent-windows version
+        if: steps.versions-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/Guardian-Parental-Controls/agent-windows/releases/download/${RELEASE_TAG}"
+          gh api "repos/Guardian-Parental-Controls/versions/dispatches" \
+            --method POST \
+            --input - <<EOF
+          {
+            "event_type": "component-release",
+            "client_payload": {
+              "component": "agent-windows",
+              "version": "${version}",
+              "repository": "https://github.com/Guardian-Parental-Controls/agent-windows",
+              "minimum_supported_version": "1.0.0",
+              "min_server": "1.0.0",
+              "protocol_version": 1,
+              "artifacts": [
+                {
+                  "id": "windows-x86_64",
+                  "url": "${base}/guardian-agent-x86_64-pc-windows-msvc.msi",
+                  "checksum_url": "${base}/guardian-agent-x86_64-pc-windows-msvc.msi.sha256"
+                }
+              ]
+            }
+          }
+          EOF
