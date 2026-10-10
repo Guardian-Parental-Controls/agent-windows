@@ -7,93 +7,113 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v1.0.0)"
+        description: "Release tag to build (for example v1.0.0)"
         required: true
-        default: "v1.0.0"
+        type: string
 
 permissions:
   contents: write
 
-env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          TAG="${TAG#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve
     runs-on: windows-latest
     steps:
-      - name: Check out agent-windows
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Check out agent-common
-        uses: actions/checkout@v5
-        with:
-          repository: Guardian-Parental-Controls/agent-common
-          ref: ${{ env.RELEASE_TAG }}
-          path: _agent-common
-
-      - name: Use path patch for common
-        shell: bash
-        run: |
-          mkdir -p .cargo
-          printf '%s\n' \
-            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
-            'guardian-agent-common = { path = "_agent-common" }' \
-            > .cargo/config.toml
+          ref: ${{ needs.resolve.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install WiX Toolset
-        shell: powershell
-        run: choco install wixtoolset --no-progress -y
+        run: choco install wixtoolset -y --no-progress
 
-      - name: Build release binary
-        shell: bash
-        env:
-          GUARDIAN_AGENT_VERSION: ${{ env.RELEASE_TAG }}
-        run: cargo build --release
+      - name: Build guardian-agent
+        run: cargo build --release --bin guardian-agent
 
-      - name: Package MSI release
-        shell: powershell
+      - name: Package MSI
+        shell: pwsh
         run: |
-          $version = "${{ env.RELEASE_TAG }}".TrimStart('v')
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Unsupported release tag for MSI product version: ${{ env.RELEASE_TAG }}"
-          }
-          $msiVersion = "$version.0"
-          ./scripts/package-windows-release.ps1 -Version $msiVersion -OutputDir dist
+          $wix = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
+          if (-not (Test-Path $wix)) { $wix = "${env:ProgramFiles}\WiX Toolset v3.14\bin" }
+          $env:PATH = "$wix;$env:PATH"
+          $stage = Join-Path $PWD "dist\staging"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\release\guardian-agent.exe" (Join-Path $stage "guardian-agent.exe")
+          Copy-Item "overlay_resources\blockedv2.html" (Join-Path $stage "blockedv2.html")
+          $wixObj = Join-Path $PWD "dist\guardian-agent.wixobj"
+          $msiName = "guardian-agent-x86_64-pc-windows-msvc.msi"
+          $msiPath = Join-Path $PWD "dist\$msiName"
+          & candle.exe "-dVersion=${{ needs.resolve.outputs.version }}" "-dSourceDir=$stage" guardian-agent.wxs -out $wixObj
+          & light.exe -ext WixUIExtension $wixObj -out $msiPath
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $msiPath).Hash.ToLower()
+          Set-Content -Path "$msiPath.sha256" -Value $hash -NoNewline
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: windows-release
-          path: |
-            dist/guardian-agent-x86_64-pc-windows-msvc.msi
-            dist/guardian-agent-x86_64-pc-windows-msvc.msi.sha256
+          name: windows-x86_64
+          path: dist/guardian-agent-x86_64-pc-windows-msvc.msi*
 
   publish:
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
         with:
-          name: windows-release
-          path: dist
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: artifacts
+
+      - name: Recreate empty immutable release (backfill)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          ASSETS="$(gh release view "$TAG" --json assets -q '.assets|length')"
+          IMMUTABLE="$(gh release view "$TAG" --json isImmutable -q .isImmutable)"
+          if [[ "$ASSETS" == "0" && "$IMMUTABLE" == "true" ]]; then
+            echo "Removing empty immutable release ${TAG} so binaries can be attached"
+            gh release delete "$TAG" --yes
+          fi
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          generate_release_notes: true
+          files: artifacts/*
 
-      - name: Create versions automation token
-        if: secrets.GUARDIAN_VERSIONS_APP_ID != ''
-        id: versions-token
-        continue-on-error: true
+      - name: Create automation token
+        id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
@@ -101,34 +121,53 @@ jobs:
           owner: Guardian-Parental-Controls
           repositories: versions
 
-      - name: Publish agent-windows version
-        if: steps.versions-token.outcome == 'success'
+      - name: Publish versions feed component
         env:
-          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#v}"
-          base="https://github.com/Guardian-Parental-Controls/agent-windows/releases/download/${RELEASE_TAG}"
-          gh api "repos/Guardian-Parental-Controls/versions/dispatches" \
-            --method POST \
-            --input - <<EOF
-          {
-            "event_type": "component-release",
-            "client_payload": {
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          owner_repo = os.environ["REPO"]
+          base = f"https://github.com/{owner_repo}/releases/download/{tag}"
+          msi = "guardian-agent-x86_64-pc-windows-msvc.msi"
+
+          checkout = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "repos/Guardian-Parental-Controls/versions/contents/components/agent-windows.json",
+                  "--jq",
+                  ".content",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          current = json.loads(base64.b64decode(checkout.stdout).decode("utf-8"))
+          payload = {
+              **current,
               "component": "agent-windows",
-              "version": "${version}",
-              "repository": "https://github.com/Guardian-Parental-Controls/agent-windows",
-              "minimum_supported_version": "1.0.0",
-              "min_server": "1.0.0",
-              "protocol_version": 1,
+              "version": version,
+              "repository": f"https://github.com/{owner_repo}",
               "artifacts": [
-                {
-                  "id": "windows-x86_64",
-                  "url": "${base}/guardian-agent-x86_64-pc-windows-msvc.msi",
-                  "checksum_url": "${base}/guardian-agent-x86_64-pc-windows-msvc.msi.sha256"
-                }
-              ]
-            }
+                  {
+                      "id": "windows-x86_64",
+                      "url": f"{base}/{msi}",
+                      "checksum_url": f"{base}/{msi}.sha256",
+                  }
+              ],
           }
-          EOF
+          body = {"event_type": "component-release", "client_payload": payload}
+          Path("dispatch.json").write_text(json.dumps(body), encoding="utf-8")
+          PY
+          gh api --method POST repos/Guardian-Parental-Controls/versions/dispatches --input dispatch.json
