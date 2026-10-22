@@ -10,19 +10,16 @@
         <Property Id="SERVER_URL" Value="ws://localhost:5000/ws" Secure="yes" />
         <Property Id="REGISTRATION_TOKEN" Secure="yes" />
 
-        <!-- Custom Actions to write config.json using CustomActionData (since write runs deferred as LocalSystem) -->
-        <CustomAction Id="SetWriteConfigActionData" Property="WriteConfigAction" Value="[SERVER_URL]|||[REGISTRATION_TOKEN]" />
-        
+        <!-- The executable reads install.ini. Installer-controlled values never enter a command line. -->
         <CustomAction Id="WriteConfigAction"
-                      Directory="INSTALLFOLDER"
-                      ExeCommand="powershell.exe -ExecutionPolicy Bypass -Command &quot;$parts = '[CustomActionData]' -split '\|\|\|'; $server = $parts[0]; $token = if ($parts.Length -gt 1) { $parts[1] } else { '' }; New-Item -ItemType Directory -Force -Path 'C:\ProgramData\Guardian'; @{ server_url = $server; registration_token = $token } | ConvertTo-Json | Out-File -FilePath 'C:\ProgramData\Guardian\config.json' -Encoding utf8&quot;"
+                      FileKey="GuardianAgentEXE"
+                      ExeCommand="--install-config-from-ini"
                       Execute="deferred"
                       Impersonate="no"
                       Return="check" />
 
         <InstallExecuteSequence>
-            <Custom Action="SetWriteConfigActionData" Before="WriteConfigAction">NOT Installed</Custom>
-            <Custom Action="WriteConfigAction" Before="RemoveLegacyService">NOT Installed</Custom>
+            <Custom Action="WriteConfigAction" After="InstallFiles">NOT Installed</Custom>
             <Custom Action="RemoveLegacyService" Before="InstallServices">NOT Installed</Custom>
         </InstallExecuteSequence>
 
@@ -106,6 +103,24 @@
                     Wait="yes" />
             </Component>
             
+            <Component Id="InstallConfigIni" Guid="f4b27670-3df1-4322-87eb-12df713f01af">
+                <IniFile Id="InstallServerUrl"
+                         Directory="INSTALLFOLDER"
+                         Name="install.ini"
+                         Section="install"
+                         Key="server_url"
+                         Value="[SERVER_URL]"
+                         Action="addLine"
+                         KeyPath="yes" />
+                <IniFile Id="InstallRegistrationToken"
+                         Directory="INSTALLFOLDER"
+                         Name="install.ini"
+                         Section="install"
+                         Key="registration_token"
+                         Value="[REGISTRATION_TOKEN]"
+                         Action="addLine" />
+            </Component>
+
             <Component Id="UserAgentAutostart" Guid="b4b27670-3df1-4322-87eb-12df713f01ab">
                 <!-- Registry key for startup of user-agent helper -->
                 <RegistryValue

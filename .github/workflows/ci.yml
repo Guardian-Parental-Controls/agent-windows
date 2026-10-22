@@ -7,11 +7,11 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: Guardian-Parental-Controls/agent-common
-          ref: v1.0.0
+          ref: fc2a238c3d18e075e8092f2ce2711a6912ef1690 # v1.0.0
           path: _agent-common
       - name: Use path patch for common
         shell: bash
@@ -21,5 +21,5 @@ jobs:
             '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
             'guardian-agent-common = { path = "_agent-common" }' \
             > .cargo/config.toml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - run: cargo test --lib

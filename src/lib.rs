@@ -19,6 +19,7 @@ pub mod screenshot;
 pub mod screenshots;
 pub mod updater;
 pub mod users;
+pub mod windows_security;
 
 #[cfg(target_os = "windows")]
 pub mod windows_service;

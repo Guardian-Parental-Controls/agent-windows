@@ -396,6 +396,10 @@ impl DomainPolicyRuntime {
 
     async fn apply_state(&mut self, state: &PersistedDomainPolicyState) -> Result<(), String> {
         let resolved_policies = resolve_uid_policies(state);
+        #[cfg(target_os = "windows")]
+        if !resolved_policies.is_empty() {
+            return crate::windows_service::dns_proxy::configure_system_dns().await;
+        }
         let dns_policies: Vec<DnsPolicy> = resolved_policies
             .iter()
             .map(|policy| DnsPolicy {
@@ -456,11 +460,12 @@ fn policy_state_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let primary_dir = PathBuf::from(r"C:\ProgramData\Guardian");
-        if fs::create_dir_all(&primary_dir).is_ok() {
-            return primary_dir.join("domain-policy.json");
-        }
+        let _ = crate::windows_security::ensure_secure_directory(&primary_dir);
+        return primary_dir.join("domain-policy.json");
     }
 
+    #[cfg(not(target_os = "windows"))]
+    {
     let primary_dir = PathBuf::from("/var/lib/guardian-agent");
     if fs::create_dir_all(&primary_dir).is_ok() {
         return primary_dir.join("domain-policy.json");
@@ -469,6 +474,7 @@ fn policy_state_path() -> PathBuf {
     let fallback_dir = PathBuf::from("/etc/guardian-agent");
     let _ = fs::create_dir_all(&fallback_dir);
     fallback_dir.join("domain-policy.json")
+    }
 }
 
 fn load_state(path: &PathBuf) -> Result<PersistedDomainPolicyState, String> {

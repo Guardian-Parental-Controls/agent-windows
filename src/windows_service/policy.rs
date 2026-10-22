@@ -65,7 +65,7 @@ fn persist_app_policy(state: &CachedAppPolicy) -> Result<(), String> {
         .parent()
         .map(|p| p.to_path_buf());
     if let Some(dir) = parent {
-        fs::create_dir_all(&dir).map_err(|e| format!("failed to create policy dir: {}", e))?;
+        crate::windows_security::ensure_secure_directory(&dir)?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize app policy: {}", e))?;
@@ -77,7 +77,7 @@ fn persist_device_policy(state: &CachedDevicePolicy) -> Result<(), String> {
         .parent()
         .map(|p| p.to_path_buf());
     if let Some(dir) = parent {
-        fs::create_dir_all(&dir).map_err(|e| format!("failed to create policy dir: {}", e))?;
+        crate::windows_security::ensure_secure_directory(&dir)?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize device policy: {}", e))?;

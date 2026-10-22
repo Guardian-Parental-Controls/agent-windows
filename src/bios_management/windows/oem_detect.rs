@@ -1,5 +1,3 @@
-use std::process::Command;
-
 use crate::bios_management::baseline::normalize_manufacturer;
 use crate::bios_management::compliance::OemDetectResult;
 
@@ -60,16 +58,7 @@ $bios = Get-CimInstance -ClassName Win32_BIOS
 Write-Output ("MANUFACTURER=" + $system.Manufacturer)
 Write-Output ("MODEL=" + $bios.Name)
 "#;
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()
+    let output = crate::windows_security::run_encoded_powershell(script, &[])
         .map_err(|error| format!("Failed to execute WMI detection script: {error}"))?;
 
     if !output.status.success() {

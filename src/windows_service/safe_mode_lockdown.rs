@@ -31,8 +31,7 @@ fn load_state() -> PersistedSafeModeLockdown {
 fn save_state(state: &PersistedSafeModeLockdown) -> Result<(), String> {
     let path = state_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        crate::windows_security::ensure_secure_directory(parent)?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize safe mode lockdown state: {}", e))?;

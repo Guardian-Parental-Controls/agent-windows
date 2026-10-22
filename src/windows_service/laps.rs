@@ -34,9 +34,6 @@ const UF_ACCOUNTDISABLE: u32 = 0x0002;
 #[cfg(target_os = "windows")]
 const UF_PASSWD_NOTREQD: u32 = 0x0020;
 #[cfg(target_os = "windows")]
-const UF_NORMAL_ACCOUNT: u32 = 0x0200;
-
-#[cfg(target_os = "windows")]
 #[repr(C)]
 struct USER_INFO_1 {
     usri1_name: *mut u16,
@@ -52,14 +49,7 @@ struct USER_INFO_1 {
 #[cfg(target_os = "windows")]
 #[repr(C)]
 struct USER_INFO_1003 {
-    usri1003_name: *mut u16,
     usri1003_password: *mut u16,
-    usri1003_password_age: u32,
-    usri1003_priv: u32,
-    usri1003_home_dir: *mut u16,
-    usri1003_comment: *mut u16,
-    usri1003_flags: u32,
-    usri1003_script_path: *mut u16,
 }
 
 #[cfg(target_os = "windows")]
@@ -107,8 +97,7 @@ fn load_laps_state() -> LapsState {
 fn save_laps_state(state: &LapsState) -> Result<(), String> {
     let path = laps_state_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        crate::windows_security::ensure_secure_directory(parent)?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize LAPS state: {}", e))?;
@@ -190,17 +179,10 @@ fn should_rotate_administrator() -> Result<bool, String> {
 #[cfg(target_os = "windows")]
 fn set_administrator_password(new_password: &str) -> Result<(), String> {
     unsafe {
-        let mut username = wide_string(ADMIN_USERNAME);
+        let username = wide_string(ADMIN_USERNAME);
         let mut password = wide_string(new_password);
         let mut info = USER_INFO_1003 {
-            usri1003_name: username.as_mut_ptr(),
             usri1003_password: password.as_mut_ptr(),
-            usri1003_password_age: 0,
-            usri1003_priv: 1,
-            usri1003_home_dir: std::ptr::null_mut(),
-            usri1003_comment: std::ptr::null_mut(),
-            usri1003_flags: UF_NORMAL_ACCOUNT,
-            usri1003_script_path: std::ptr::null_mut(),
         };
         let status = NetUserSetInfo(
             std::ptr::null(),
@@ -226,6 +208,22 @@ fn set_administrator_password(new_password: &str) -> Result<(), String> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn user_info_1003_is_exactly_one_pointer() {
+        assert_eq!(
+            std::mem::size_of::<super::USER_INFO_1003>(),
+            std::mem::size_of::<*mut u16>()
+        );
+        assert_eq!(
+            std::mem::align_of::<super::USER_INFO_1003>(),
+            std::mem::align_of::<*mut u16>()
+        );
     }
 }
 

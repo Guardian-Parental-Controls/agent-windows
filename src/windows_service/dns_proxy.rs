@@ -1,50 +1,18 @@
-use std::process::Command;
-
 pub async fn configure_system_dns() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        println!("Configuring Windows active adapters to use loopback DNS server...");
-        // Set DNS address to 127.0.0.1
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                "Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.ConnectionState -eq 2 -and $_.InterfaceAlias -notlike '*Loopback*' } | Set-DnsClientServerAddress -ServerAddresses '127.0.0.1'"
-            ])
-            .status();
-
-        if status.is_err() || !status.unwrap().success() {
-            return Err("Failed to configure DNS client server address via PowerShell".to_string());
-        }
-
-        // Add firewall rule to block external DNS queries on port 53 (prevent bypass)
-        let _ = Command::new("powershell")
-            .args([
-                "-Command",
-                "New-NetFirewallRule -DisplayName 'TimeKpr Block DNS Bypass' -Direction Outbound -LocalPort 53 -Protocol UDP -Action Block -Force"
-            ])
-            .status();
+        return Err(
+            "Windows DNS enforcement is unavailable: per-user policy listeners cannot be \
+             redirected with Windows Defender Firewall; refusing to point the system resolver \
+             at an unbound loopback port"
+                .to_string(),
+        );
     }
+    #[cfg(not(target_os = "windows"))]
     Ok(())
 }
 
 pub async fn restore_system_dns() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        println!("Restoring original DNS server addresses...");
-        let _ = Command::new("powershell")
-            .args([
-                "-Command",
-                "Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.ConnectionState -eq 2 -and $_.InterfaceAlias -notlike '*Loopback*' } | Set-DnsClientServerAddress -ResetServerAddresses"
-            ])
-            .status();
-
-        let _ = Command::new("powershell")
-            .args([
-                "-Command",
-                "Remove-NetFirewallRule -DisplayName 'TimeKpr Block DNS Bypass' -ErrorAction SilentlyContinue"
-            ])
-            .status();
-    }
     Ok(())
 }
 

@@ -166,25 +166,24 @@ fn dismiss_overlay() {
 fn show_toast_notification(title: &str, message: &str) {
     println!("Showing Toast: {} - {}", title, message);
 
-    let clean_title = title.replace('\'', "\"");
-    let clean_message = message.replace('\'', "\"");
-
-    let ps_script = format!(
+    let ps_script =
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
          $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
          $toastXml = [xml]$template.GetXml(); \
-         $toastXml.toast.visual.binding.text[0].AppendChild($toastXml.CreateTextNode('{}')) | Out-Null; \
-         $toastXml.toast.visual.binding.text[1].AppendChild($toastXml.CreateTextNode('{}')) | Out-Null; \
+         $toastXml.toast.visual.binding.text[0].AppendChild($toastXml.CreateTextNode($env:GUARDIAN_TOAST_TITLE)) | Out-Null; \
+         $toastXml.toast.visual.binding.text[1].AppendChild($toastXml.CreateTextNode($env:GUARDIAN_TOAST_MESSAGE)) | Out-Null; \
          $xml = New-Object Windows.Data.Xml.Dom.XmlDocument; \
          $xml.LoadXml($toastXml.OuterXml); \
          $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('TimeKpr').Show($toast)",
-        clean_title, clean_message
-    );
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Guardian').Show($toast)";
 
-    let _ = Command::new("powershell")
-        .args(["-Command", &ps_script])
-        .spawn();
+    let _ = crate::windows_security::run_encoded_powershell(
+        ps_script,
+        &[
+            ("GUARDIAN_TOAST_TITLE", title),
+            ("GUARDIAN_TOAST_MESSAGE", message),
+        ],
+    );
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -3,13 +3,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
-fn get_ipc_connections() -> &'static Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<String>>>> {
-    static IPC_CONNECTIONS: OnceLock<Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<String>>>>> =
+const MAX_TOAST_PIPE_CLIENTS: usize = 16;
+const TOAST_QUEUE_DEPTH: usize = 64;
+const PIPE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn get_ipc_connections() -> &'static Arc<Mutex<HashMap<u32, mpsc::Sender<String>>>> {
+    static IPC_CONNECTIONS: OnceLock<Arc<Mutex<HashMap<u32, mpsc::Sender<String>>>>> =
         OnceLock::new();
     IPC_CONNECTIONS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
-pub fn register_ipc_client(id: u32, tx: mpsc::UnboundedSender<String>) {
+pub fn register_ipc_client(id: u32, tx: mpsc::Sender<String>) {
     let mut guard = get_ipc_connections().lock().unwrap();
     guard.insert(id, tx);
 }
@@ -31,7 +35,7 @@ pub fn broadcast_json(payload: &serde_json::Value) {
     if let Ok(serialized) = serde_json::to_string(payload) {
         let guard = get_ipc_connections().lock().unwrap();
         for tx in guard.values() {
-            let _ = tx.send(serialized.clone());
+            let _ = tx.try_send(serialized.clone());
         }
     }
 }
@@ -46,10 +50,26 @@ pub async fn start_ipc_server() {
         {
             use tokio::net::windows::named_pipe::ServerOptions;
             let pipe_name = r"\\.\pipe\timekpr_ipc";
-            let server = match ServerOptions::new()
+            let mut security =
+                match crate::windows_security::PipeSecurity::authenticated_users() {
+                    Ok(security) => security,
+                    Err(error) => {
+                        eprintln!("Failed to secure Named Pipe: {error}");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+            let mut options = ServerOptions::new();
+            options
                 .first_pipe_instance(client_id_counter == 0)
-                .create(pipe_name)
-            {
+                .max_instances(MAX_TOAST_PIPE_CLIENTS)
+                .out_buffer_size(64 * 1024);
+            let server = match unsafe {
+                options.create_with_security_attributes_raw(
+                    pipe_name,
+                    security.attributes_mut_ptr().cast(),
+                )
+            } {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Failed to create Named Pipe server instance: {}", e);
@@ -62,17 +82,26 @@ pub async fn start_ipc_server() {
             if server.connect().await.is_ok() {
                 client_id_counter += 1;
                 let id = client_id_counter;
-                let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+                if get_ipc_connections().lock().unwrap().len() >= MAX_TOAST_PIPE_CLIENTS {
+                    continue;
+                }
+                let (tx, mut rx) = mpsc::channel::<String>(TOAST_QUEUE_DEPTH);
                 register_ipc_client(id, tx);
 
                 tokio::spawn(async move {
                     let mut pipe = server;
                     while let Some(msg) = rx.recv().await {
                         // Write message to the named pipe
-                        if pipe.write_all(msg.as_bytes()).await.is_err() {
+                        let write = async {
+                            pipe.write_all(msg.as_bytes()).await?;
+                            pipe.write_all(b"\n").await
+                        };
+                        if !matches!(
+                            tokio::time::timeout(PIPE_WRITE_TIMEOUT, write).await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
-                        let _ = pipe.write_all(b"\n").await;
                     }
                     unregister_ipc_client(id);
                 });

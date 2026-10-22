@@ -21,6 +21,52 @@ pub fn payload_present(vendor: &str) -> bool {
     payload_dir(vendor).is_dir()
 }
 
+fn validate_payload(vendor: &str) -> Result<(), String> {
+    if !matches!(vendor, "dell" | "hp" | "lenovo" | "surface") {
+        return Err("refusing unsupported BIOS payload vendor".to_string());
+    }
+    let root = PathBuf::from(PAYLOAD_ROOT);
+    crate::windows_security::ensure_secure_directory(&root)?;
+    let target = payload_dir(vendor);
+    let target_text = target.to_string_lossy().into_owned();
+    const VERIFY_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$root = Get-Item -LiteralPath $env:GUARDIAN_PAYLOAD_TARGET -Force
+if (-not $root.PSIsContainer -or (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw 'BIOS payload target is not a safe directory'
+}
+$codeExtensions = @('.exe', '.dll', '.sys', '.ps1', '.psm1', '.psd1')
+foreach ($directory in Get-ChildItem -LiteralPath $root.FullName -Recurse -Directory -Force) {
+    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "BIOS payload contains a reparse point: $($directory.FullName)"
+    }
+}
+foreach ($file in Get-ChildItem -LiteralPath $root.FullName -Recurse -File) {
+    if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "BIOS payload contains a reparse point: $($file.FullName)"
+    }
+    if ($codeExtensions -contains $file.Extension.ToLowerInvariant()) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "unsigned or invalid payload code: $($file.FullName) ($($signature.Status))"
+        }
+    }
+}
+"#;
+    let output = crate::windows_security::run_encoded_powershell(
+        VERIFY_SCRIPT,
+        &[("GUARDIAN_PAYLOAD_TARGET", &target_text)],
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "BIOS payload verification failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 pub fn run_vendor_audit(
     oem: &str,
     model: Option<String>,
@@ -42,6 +88,7 @@ pub fn run_vendor_audit(
         receipt.finalize();
         return Ok(receipt);
     }
+    validate_payload(oem)?;
 
     match oem {
         "dell" => audit_dell(&mut receipt)?,
@@ -66,6 +113,7 @@ pub fn run_vendor_apply(
             "Vendor payload for {oem} is not staged under {PAYLOAD_ROOT}"
         ));
     }
+    validate_payload(oem)?;
 
     let password = password::generate_supervisor_password(16);
     let mut receipt = HardwareReceipt::new("windows", oem, model, interface);
@@ -100,18 +148,8 @@ pub fn run_vendor_apply(
     }
 }
 
-fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()
-        .map_err(|error| format!("Failed to execute PowerShell: {error}"))?;
+fn run_powershell(script: &str, environment: &[(&str, &str)]) -> Result<String, String> {
+    let output = crate::windows_security::run_encoded_powershell(script, environment)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -152,35 +190,37 @@ fn apply_dell(password: &str, _force_reset_password: bool) -> Result<(), String>
 }
 
 fn audit_hp(receipt: &mut HardwareReceipt) -> Result<(), String> {
-    let script = format!(
-        r#"
-$module = Join-Path '{}' 'HP.ClientManagementScriptLibrary.dll'
-if (-not (Test-Path $module)) {{ throw "HP CMSL module not found" }}
+    let script = r#"
+$module = Join-Path $env:GUARDIAN_PAYLOAD_DIR 'HP.ClientManagementScriptLibrary.dll'
+if (-not (Test-Path $module)) { throw "HP CMSL module not found" }
 Import-Module $module
 $boot = Get-HPBIOSSettingValue -Name 'Secure Boot'
 Write-Output $boot
-"#,
-        payload_dir("hp").display()
-    );
-    let stdout = run_powershell(&script)?;
+"#;
+    let payload = payload_dir("hp").to_string_lossy().into_owned();
+    let stdout = run_powershell(script, &[("GUARDIAN_PAYLOAD_DIR", &payload)])?;
     receipt.secure_boot_enabled.actual = json!(stdout.to_ascii_lowercase().contains("enable"));
     receipt.secure_boot_enabled.applied = stdout.to_ascii_lowercase().contains("enable");
     Ok(())
 }
 
 fn apply_hp(password: &str, _force_reset_password: bool) -> Result<(), String> {
-    let script = format!(
-        r#"
-$module = Join-Path '{}' 'HP.ClientManagementScriptLibrary.dll'
-if (-not (Test-Path $module)) {{ throw "HP CMSL module not found" }}
+    let script = r#"
+$module = Join-Path $env:GUARDIAN_PAYLOAD_DIR 'HP.ClientManagementScriptLibrary.dll'
+if (-not (Test-Path $module)) { throw "HP CMSL module not found" }
 Import-Module $module
-Set-HPBIOSSettingValue -Name 'Setup Password' -Value '{}'
+Set-HPBIOSSettingValue -Name 'Setup Password' -Value $env:GUARDIAN_BIOS_PASSWORD
 Set-HPBIOSSettingValue -Name 'Secure Boot' -Value 'Enable'
-"#,
-        payload_dir("hp").display(),
-        password.replace('\'', "''")
-    );
-    run_powershell(&script).map(|_| ())
+"#;
+    let payload = payload_dir("hp").to_string_lossy().into_owned();
+    run_powershell(
+        script,
+        &[
+            ("GUARDIAN_PAYLOAD_DIR", &payload),
+            ("GUARDIAN_BIOS_PASSWORD", password),
+        ],
+    )
+    .map(|_| ())
 }
 
 fn audit_lenovo(receipt: &mut HardwareReceipt) -> Result<(), String> {
@@ -188,52 +228,55 @@ fn audit_lenovo(receipt: &mut HardwareReceipt) -> Result<(), String> {
 $boot = (Get-CimInstance -Namespace root/wmi -ClassName Lenovo_BiosSetting -Filter "Name='Secure Boot'" -ErrorAction SilentlyContinue).CurrentSetting
 Write-Output $boot
 "#;
-    let stdout = run_powershell(script).unwrap_or_default();
+    let stdout = run_powershell(script, &[]).unwrap_or_default();
     receipt.secure_boot_enabled.actual = json!(stdout.to_ascii_lowercase().contains("enable"));
     receipt.secure_boot_enabled.applied = stdout.to_ascii_lowercase().contains("enable");
     Ok(())
 }
 
 fn apply_lenovo(password: &str, _force_reset_password: bool) -> Result<(), String> {
-    let script = format!(
-        r#"
-$password = '{}'
+    let script = r#"
+$password = $env:GUARDIAN_BIOS_PASSWORD
 $setter = Get-CimInstance -Namespace root/wmi -ClassName Lenovo_SetBiosSetting -ErrorAction Stop
-Invoke-CimMethod -InputObject $setter -MethodName SetBiosSetting -Arguments @{{ Parameter = "Password,$password,ascii,us" }} | Out-Null
-Invoke-CimMethod -InputObject $setter -MethodName SetBiosSetting -Arguments @{{ Parameter = "Secure Boot,Enable" }} | Out-Null
-"#,
-        password.replace('\'', "''")
-    );
-    run_powershell(&script).map(|_| ())
+Invoke-CimMethod -InputObject $setter -MethodName SetBiosSetting -Arguments @{ Parameter = "Password,$password,ascii,us" } | Out-Null
+Invoke-CimMethod -InputObject $setter -MethodName SetBiosSetting -Arguments @{ Parameter = "Secure Boot,Enable" } | Out-Null
+"#;
+    run_powershell(
+        script,
+        &[("GUARDIAN_BIOS_PASSWORD", password)],
+    )
+    .map(|_| ())
 }
 
 fn audit_surface(receipt: &mut HardwareReceipt) -> Result<(), String> {
-    let script = format!(
-        r#"
-$module = Join-Path '{}' 'SurfaceEnterpriseManagementMode.psd1'
-if (-not (Test-Path $module)) {{ throw "Surface SEMM module not found" }}
+    let script = r#"
+$module = Join-Path $env:GUARDIAN_PAYLOAD_DIR 'SurfaceEnterpriseManagementMode.psd1'
+if (-not (Test-Path $module)) { throw "Surface SEMM module not found" }
 Import-Module $module
 Write-Output 'surface-audit-ok'
-"#,
-        payload_dir("surface").display()
-    );
-    run_powershell(&script)?;
+"#;
+    let payload = payload_dir("surface").to_string_lossy().into_owned();
+    run_powershell(script, &[("GUARDIAN_PAYLOAD_DIR", &payload)])?;
     receipt.secure_boot_enabled.actual = json!("unknown");
     Ok(())
 }
 
 fn apply_surface(password: &str, _force_reset_password: bool) -> Result<(), String> {
-    let script = format!(
-        r#"
-$module = Join-Path '{}' 'SurfaceEnterpriseManagementMode.psd1'
-if (-not (Test-Path $module)) {{ throw "Surface SEMM module not found" }}
+    let script = r#"
+$module = Join-Path $env:GUARDIAN_PAYLOAD_DIR 'SurfaceEnterpriseManagementMode.psd1'
+if (-not (Test-Path $module)) { throw "Surface SEMM module not found" }
 Import-Module $module
-Write-Output 'surface-apply:{password}'
-"#,
-        payload_dir("surface").display(),
-        password = password.replace('\'', "''")
-    );
-    run_powershell(&script).map(|_| ())
+Write-Output 'surface-apply'
+"#;
+    let payload = payload_dir("surface").to_string_lossy().into_owned();
+    run_powershell(
+        script,
+        &[
+            ("GUARDIAN_PAYLOAD_DIR", &payload),
+            ("GUARDIAN_BIOS_PASSWORD", password),
+        ],
+    )
+    .map(|_| ())
 }
 
 pub fn stage_payload_from_server(
@@ -241,38 +284,95 @@ pub fn stage_payload_from_server(
     server_url: &str,
     agent_token: &str,
 ) -> Result<(), String> {
-    let base = server_url
+    if !matches!(vendor, "dell" | "hp" | "lenovo" | "surface") {
+        return Err("refusing unsupported BIOS payload vendor".to_string());
+    }
+    let mut base = server_url
         .trim_end_matches("/ws")
         .trim_end_matches('/')
         .to_string();
+    if base.starts_with("wss://") {
+        base.replace_range(..6, "https://");
+    } else if base.starts_with("ws://") {
+        base.replace_range(..5, "http://");
+    }
     let url = format!("{base}/api/agent/bios-payloads/{vendor}");
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                r#"
-$headers = @{{ Authorization = 'Bearer {agent_token}' }}
-$target = '{payload_root}\{vendor}'
-New-Item -ItemType Directory -Force -Path $target | Out-Null
-$archive = Join-Path $target 'payload.zip'
-Invoke-WebRequest -Uri '{url}' -Headers $headers -OutFile $archive
-Expand-Archive -Path $archive -DestinationPath $target -Force
-Remove-Item $archive
-"#,
-                agent_token = agent_token,
-                payload_root = PAYLOAD_ROOT,
-                vendor = vendor,
-                url = url,
-            ),
-        ])
-        .status()
-        .map_err(|error| format!("Failed to stage BIOS payload: {error}"))?;
-    if !output.success() {
-        return Err("PowerShell payload staging script failed".to_string());
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|error| format!("invalid BIOS payload URL: {error}"))?;
+    if parsed.scheme() != "https" {
+        return Err("BIOS payload download requires HTTPS".to_string());
+    }
+
+    let root = PathBuf::from(PAYLOAD_ROOT);
+    crate::windows_security::ensure_secure_directory(&root)?;
+    let target = payload_dir(vendor);
+    let root_text = root.to_string_lossy().into_owned();
+    let target_text = target.to_string_lossy().into_owned();
+    const STAGE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$headers = @{ Authorization = "Bearer $env:GUARDIAN_AGENT_TOKEN" }
+$work = Join-Path $env:GUARDIAN_PAYLOAD_ROOT ([Guid]::NewGuid().ToString('N'))
+$archive = "$work.zip"
+$staging = "$work.extract"
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri $env:GUARDIAN_PAYLOAD_URL -Headers $headers -OutFile $archive
+    Invoke-WebRequest -UseBasicParsing -Uri ($env:GUARDIAN_PAYLOAD_URL + '.sha256') -Headers $headers -OutFile ($archive + '.sha256')
+    $expected = ((Get-Content -LiteralPath ($archive + '.sha256') -Raw).Trim() -split '\s+')[0]
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') { throw 'invalid BIOS payload checksum sidecar' }
+    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+    if ($actual -ine $expected) { throw 'BIOS payload checksum mismatch' }
+
+    New-Item -ItemType Directory -Path $staging | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $prefix = [IO.Path]::GetFullPath($staging).TrimEnd('\') + '\'
+        foreach ($entry in $zip.Entries) {
+            $candidate = [IO.Path]::GetFullPath((Join-Path $staging $entry.FullName))
+            if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "archive entry escapes destination: $($entry.FullName)"
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    [IO.Compression.ZipFile]::ExtractToDirectory($archive, $staging)
+
+    $codeExtensions = @('.exe', '.dll', '.sys', '.ps1', '.psm1', '.psd1')
+    foreach ($file in Get-ChildItem -LiteralPath $staging -Recurse -File) {
+        if ($codeExtensions -contains $file.Extension.ToLowerInvariant()) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+                throw "unsigned or invalid payload code: $($file.FullName) ($($signature.Status))"
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $env:GUARDIAN_PAYLOAD_TARGET) {
+        $existing = Get-Item -LiteralPath $env:GUARDIAN_PAYLOAD_TARGET -Force
+        if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'refusing reparse-point BIOS payload target'
+        }
+        Remove-Item -LiteralPath $existing.FullName -Recurse -Force
+    }
+    Move-Item -LiteralPath $staging -Destination $env:GUARDIAN_PAYLOAD_TARGET
+} finally {
+    Remove-Item -LiteralPath $archive,($archive + '.sha256'),$work,$staging -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#;
+    let output = crate::windows_security::run_encoded_powershell(
+        STAGE_SCRIPT,
+        &[
+            ("GUARDIAN_AGENT_TOKEN", agent_token),
+            ("GUARDIAN_PAYLOAD_URL", &url),
+            ("GUARDIAN_PAYLOAD_ROOT", &root_text),
+            ("GUARDIAN_PAYLOAD_TARGET", &target_text),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "secure BIOS payload staging failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     if !payload_dir(vendor).is_dir() {
         return Err("Payload directory missing after staging".to_string());

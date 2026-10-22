@@ -24,8 +24,7 @@ fn load_state() -> ClockIntegrityState {
 pub fn save_state(state: &ClockIntegrityState) -> Result<(), String> {
     let path = state_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        crate::windows_security::ensure_secure_directory(parent)?;
     }
     let json = state.to_json()?;
     fs::write(&path, json).map_err(|e| format!("failed to write {}: {}", path.display(), e))

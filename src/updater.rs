@@ -1,9 +1,49 @@
 use std::time::Duration;
+use std::{fs::OpenOptions, io::Write, path::Path};
 
 use guardian_agent::UpdateOffer;
 use guardian_agent::update_verify;
+use uuid::Uuid;
 
 const DEFAULT_GITHUB_REPO: &str = "Guardian-Parental-Controls/agent-windows";
+
+fn validate_release_urls(download_url: &str, checksum_url: &str) -> Result<(), String> {
+    let download = reqwest::Url::parse(download_url)
+        .map_err(|error| format!("invalid release URL: {error}"))?;
+    let checksum = reqwest::Url::parse(checksum_url)
+        .map_err(|error| format!("invalid checksum URL: {error}"))?;
+    if download.scheme() != "https" || checksum.scheme() != "https" {
+        return Err("release and checksum URLs must use HTTPS".to_string());
+    }
+    if download.origin() != checksum.origin() {
+        return Err("release and checksum URLs must have the same trusted origin".to_string());
+    }
+    if !checksum.path().ends_with(".sha256") {
+        return Err("checksum URL must identify a .sha256 sidecar".to_string());
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("failed to securely create {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn verify_publisher(path: &Path) -> Result<(), String> {
+    crate::windows_security::verify_authenticode(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn verify_publisher(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
 
 async fn download_release_bytes(
     client: &reqwest::Client,
@@ -68,6 +108,7 @@ pub async fn apply_update(offer: UpdateOffer) -> Result<(), String> {
         .build()
         .map_err(|error| format!("Failed to build HTTP client: {error}"))?;
 
+    validate_release_urls(&download_url, &checksum_url)?;
     let bytes = download_release_bytes(&client, &download_url, "release asset").await?;
     let checksum_bytes = download_release_bytes(&client, &checksum_url, "release checksum").await?;
     let checksum_text = String::from_utf8(checksum_bytes)
@@ -75,13 +116,26 @@ pub async fn apply_update(offer: UpdateOffer) -> Result<(), String> {
     update_verify::verify_release_asset(&bytes, &checksum_text)?;
 
     if download_url.ends_with(".msi") || bytes.starts_with(b"\xD0\xCF\x11\xE0") {
-        let temp_msi = std::env::temp_dir().join("guardian-agent-update.msi");
-        std::fs::write(&temp_msi, &bytes)
-            .map_err(|error| format!("Failed to write MSI update: {error}"))?;
-        let status = std::process::Command::new("msiexec")
+        #[cfg(target_os = "windows")]
+        let update_dir = {
+            let path = crate::windows_security::ensure_guardian_data_dir()?.join("updates");
+            crate::windows_security::ensure_secure_directory(&path)?;
+            path
+        };
+        #[cfg(not(target_os = "windows"))]
+        let update_dir = std::env::temp_dir();
+        let temp_msi = update_dir.join(format!("guardian-update-{}.msi", Uuid::new_v4()));
+        write_new_file(&temp_msi, &bytes)?;
+        if let Err(error) = verify_publisher(&temp_msi) {
+            let _ = std::fs::remove_file(&temp_msi);
+            return Err(error);
+        }
+        let status_result = std::process::Command::new("msiexec")
             .args(["/i", &temp_msi.to_string_lossy(), "/qn", "/norestart"])
-            .status()
-            .map_err(|error| format!("Failed to launch msiexec: {error}"))?;
+            .status();
+        let _ = std::fs::remove_file(&temp_msi);
+        let status =
+            status_result.map_err(|error| format!("Failed to launch msiexec: {error}"))?;
         if !status.success() {
             return Err(format!("msiexec exited with {status}"));
         }
@@ -91,13 +145,40 @@ pub async fn apply_update(offer: UpdateOffer) -> Result<(), String> {
 
     let current_bin = std::env::current_exe()
         .map_err(|error| format!("Failed to determine current executable path: {error}"))?;
-    let temp_bin = current_bin.with_extension("tmp");
-    std::fs::write(&temp_bin, &bytes)
-        .map_err(|error| format!("Failed to write temporary binary file: {error}"))?;
+    let temp_bin = current_bin.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    write_new_file(&temp_bin, &bytes)?;
+    if let Err(error) = verify_publisher(&temp_bin) {
+        let _ = std::fs::remove_file(&temp_bin);
+        return Err(error);
+    }
     std::fs::rename(&temp_bin, &current_bin).map_err(|error| {
         let _ = std::fs::remove_file(&temp_bin);
         format!("Failed to rename/replace active executable: {error}")
     })?;
     println!("Auto-update completed successfully! Active executable replaced.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_release_urls;
+
+    #[test]
+    fn update_urls_require_https_and_same_origin() {
+        assert!(validate_release_urls(
+            "https://github.com/org/repo/a.msi",
+            "https://github.com/org/repo/a.msi.sha256"
+        )
+        .is_ok());
+        assert!(validate_release_urls(
+            "http://github.com/org/repo/a.msi",
+            "https://github.com/org/repo/a.msi.sha256"
+        )
+        .is_err());
+        assert!(validate_release_urls(
+            "https://example.test/a.msi",
+            "https://attacker.test/a.msi.sha256"
+        )
+        .is_err());
+    }
 }

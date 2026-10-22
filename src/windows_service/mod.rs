@@ -35,6 +35,10 @@ define_windows_service!(ffi_service_main, timekpr_service_main);
 #[cfg(target_os = "windows")]
 pub async fn run_service() {
     println!("Starting Windows Service Dispatcher...");
+    if let Err(error) = crate::windows_security::ensure_guardian_data_dir() {
+        eprintln!("Refusing to start with unsafe Guardian ProgramData storage: {error}");
+        return;
+    }
     if let Err(e) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         eprintln!("Failed to start service dispatcher: {}", e);
         println!("Running in standalone/console mode...");
@@ -102,17 +106,25 @@ fn timekpr_service_main(_args: Vec<std::ffi::OsString>) {
 
         safeboot_registry::ensure_registered();
 
+        if let Err(error) = crate::windows_security::ensure_guardian_data_dir() {
+            eprintln!("Refusing to start with unsafe Guardian ProgramData storage: {error}");
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(5),
+                checkpoint: 0,
+                wait_hint: std::time::Duration::ZERO,
+                process_id: None,
+            });
+            return;
+        }
+
         let safe_mode = boot_mode::is_safe_mode_boot();
         if safe_mode {
             safe_mode_lockdown::on_safe_mode_service_start();
         } else {
             safe_mode_lockdown::on_normal_boot_service_start();
-        }
-
-        if !safe_mode {
-            let _ = dns_proxy::configure_system_dns().await;
-        } else {
-            println!("Safe Mode boot detected; skipping DNS reconfiguration.");
         }
 
         let service_task = tokio::spawn(run_service_tasks(Some(power_resume_rx), safe_mode));
@@ -133,7 +145,6 @@ fn timekpr_service_main(_args: Vec<std::ffi::OsString>) {
             let _ = status_handle.set_service_status(status);
         }
 
-        let _ = dns_proxy::restore_system_dns().await;
         let _ = policy::clear_on_unenroll();
 
         service_task.abort();

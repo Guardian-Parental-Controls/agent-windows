@@ -4,6 +4,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+const MAX_IPC_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_IPC_MESSAGES_PER_CONNECTION: usize = 256;
+const IPC_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "windows")]
+const MAX_WINDOWS_PIPE_CLIENTS: usize = 32;
+
 #[derive(Deserialize, Debug, Clone)]
 struct AgentConfig {
     server_url: String,
@@ -65,8 +71,7 @@ pub async fn read_framed_message<R: tokio::io::AsyncReadExt + Unpin>(
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_ne_bytes(len_bytes) as usize;
-    if len > 10 * 1024 * 1024 {
-        // Cap at 10MB to prevent excessive memory usage
+    if len > MAX_IPC_MESSAGE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Message too large",
@@ -82,10 +87,13 @@ pub async fn write_framed_message<W: tokio::io::AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> Result<(), std::io::Error> {
     let len = payload.len() as u32;
-    writer.write_all(&len.to_ne_bytes()).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
+    tokio::time::timeout(IPC_IO_TIMEOUT, async {
+        writer.write_all(&len.to_ne_bytes()).await?;
+        writer.write_all(payload).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write timed out"))?
 }
 
 #[derive(Deserialize, Debug)]
@@ -167,12 +175,38 @@ async fn handle_ipc_connection(
 async fn handle_ipc_connection(
     mut server: tokio::net::windows::named_pipe::NamedPipeServer,
     active_client_tx: Arc<Mutex<Option<mpsc::UnboundedSender<crate::ClientMessage>>>>,
+    _client_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    if !pipe_client_is_active_local_session(&server) {
+        eprintln!("IPC: rejected named-pipe client outside the active local session");
+        return;
+    }
     let username = crate::windows_service::dns_proxy::get_active_session_username()
         .unwrap_or_else(|| "windows_user".to_string());
 
     let (mut reader, mut writer) = tokio::io::split(server);
     process_ipc_messages(&mut reader, &mut writer, &username, active_client_tx).await;
+}
+
+#[cfg(target_os = "windows")]
+fn pipe_client_is_active_local_session(
+    server: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut client_session = u32::MAX;
+    let ok = unsafe {
+        windows_sys::Win32::System::Pipes::GetNamedPipeClientSessionId(
+            server.as_raw_handle() as isize,
+            &mut client_session,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let active =
+        unsafe { windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId() };
+    active != u32::MAX && client_session == active
 }
 
 async fn process_ipc_messages<
@@ -184,10 +218,14 @@ async fn process_ipc_messages<
     username: &str,
     active_client_tx: Arc<Mutex<Option<mpsc::UnboundedSender<crate::ClientMessage>>>>,
 ) {
-    loop {
-        let payload = match read_framed_message(reader).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
+    for _ in 0..MAX_IPC_MESSAGES_PER_CONNECTION {
+        let payload = match tokio::time::timeout(IPC_IO_TIMEOUT, read_framed_message(reader)).await {
+            Ok(Ok(bytes)) => bytes,
+            Err(_) => {
+                eprintln!("IPC connection timed out");
+                break;
+            }
+            Ok(Err(e)) => {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
                     eprintln!("IPC connection error reading message: {}", e);
                 }
@@ -797,6 +835,7 @@ pub async fn run_ipc_server(
 
     let pipe_name = r"\\.\pipe\guardian-agent-ipc";
     let mut first = true;
+    let client_limit = Arc::new(tokio::sync::Semaphore::new(MAX_WINDOWS_PIPE_CLIENTS));
 
     println!(
         "Guardian client agent: local Named Pipe IPC server listening on {}",
@@ -806,11 +845,21 @@ pub async fn run_ipc_server(
     loop {
         let server = {
             let mut opts = ServerOptions::new();
+            opts.max_instances(MAX_WINDOWS_PIPE_CLIENTS)
+                .in_buffer_size(MAX_IPC_MESSAGE_BYTES as u32)
+                .out_buffer_size(MAX_IPC_MESSAGE_BYTES as u32);
             if first {
                 opts.first_pipe_instance(true);
                 first = false;
             }
-            match opts.create(pipe_name) {
+            let mut security = crate::windows_security::PipeSecurity::authenticated_users()
+                .map_err(|error| format!("failed to secure IPC named pipe: {error}"))?;
+            match unsafe {
+                opts.create_with_security_attributes_raw(
+                    pipe_name,
+                    security.attributes_mut_ptr().cast(),
+                )
+            } {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Failed to create Named Pipe server instance: {}", e);
@@ -822,8 +871,15 @@ pub async fn run_ipc_server(
 
         match server.connect().await {
             Ok(_) => {
+                let permit = match client_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        eprintln!("IPC Named Pipe client limit reached");
+                        continue;
+                    }
+                };
                 let active_tx = active_client_tx.clone();
-                tokio::spawn(handle_ipc_connection(server, active_tx));
+                tokio::spawn(handle_ipc_connection(server, active_tx, permit));
             }
             Err(e) => {
                 eprintln!("IPC Named Pipe client connection error: {}", e);
@@ -1069,5 +1125,22 @@ async fn handle_ai_session_log(
                 "message": format!("Failed to route request to backend: {}", e)
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::{MAX_IPC_MESSAGE_BYTES, read_framed_message};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn framed_message_rejects_oversized_allocation() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&((MAX_IPC_MESSAGE_BYTES as u32) + 1).to_ne_bytes())
+            .await
+            .unwrap();
+        let error = read_framed_message(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }
